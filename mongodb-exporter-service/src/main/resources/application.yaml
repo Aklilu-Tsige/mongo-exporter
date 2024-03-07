@@ -1,7 +1,17 @@
+server:
+  port: 9696
+
 zeebe:
   client:
     broker:
       gateway-address: 127.0.0.1:26500
     security:
       plaintext: true
+
+spring:
+  data:
+    mongodb:
+      host: localhost
+      port: 27017
+      database: zeebe
 

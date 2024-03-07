@@ -1,0 +1,193 @@
+package com.demo.zeebemongoexporter;
+
+import com.demo.zeebemongoexporter.MongoExporterConfiguration.ColConfiguration;
+import io.camunda.zeebe.exporter.api.Exporter;
+import io.camunda.zeebe.exporter.api.ExporterException;
+import io.camunda.zeebe.exporter.api.context.Context;
+import io.camunda.zeebe.exporter.api.context.Controller;
+import io.camunda.zeebe.protocol.record.Record;
+import io.camunda.zeebe.protocol.record.RecordType;
+import io.camunda.zeebe.protocol.record.ValueType;
+import io.camunda.zeebe.spring.client.EnableZeebeClient;
+import org.slf4j.Logger;
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+import java.time.Duration;
+@SpringBootApplication
+@EnableZeebeClient
+public class MongoExporter implements Exporter {
+    // by default, the bulk request may not be bigger than 100MB
+    private static final int RECOMMENDED_MAX_BULK_MEMORY_LIMIT = 100 * 1024 * 1024;
+    private Logger log;
+    private Controller controller;
+    private MongoExporterConfiguration configuration;
+    private ZeebeMongoClient client;
+    private long lastPosition = -1;
+    private boolean colsCreated;
+
+    public static void main(String[] args) {
+        SpringApplication.run(MongoExporter.class, args);
+    }
+
+    @Override
+    public void configure(Context context) {
+        log = context.getLogger();
+        configuration =
+                context.getConfiguration().instantiate(MongoExporterConfiguration.class);
+        log.debug("Exporter configured with {}", configuration);
+        validate(configuration);
+        context.setFilter(new MongoRecordFilter(configuration));
+    }
+
+    @Override
+    public void open(Controller controller) {
+        this.controller = controller;
+        client = createClient();
+
+        scheduleDelayedFlush();
+        log.info("Exporter opened");
+    }
+
+    @Override
+    public void close() {
+        try {
+            flush();
+        } catch (final Exception e) {
+            log.warn("Failed to flush records before closing exporter.", e);
+        }
+
+        try {
+            client.close();
+        } catch (final Exception e) {
+            log.warn("Failed to close elasticsearch client", e);
+        }
+
+        log.info("Exporter closed");
+    }
+
+    @Override
+    public void export(Record<?> record) {
+        if (!colsCreated) {
+            createCols();
+        }
+
+        client.insert(record);
+        lastPosition = record.getPosition();
+
+        if (client.shouldFlush()) {
+            flush();
+        }
+    }
+
+
+
+    private void validate(final MongoExporterConfiguration configuration) {
+        if (configuration.col.prefix != null && configuration.col.prefix.contains("_")) {
+            throw new ExporterException(
+                    String.format(
+                            "Mongo prefix must not contain underscore. Current value: %s",
+                            configuration.col.prefix));
+        }
+
+        if (configuration.bulk.memoryLimit > RECOMMENDED_MAX_BULK_MEMORY_LIMIT) {
+            log.warn(
+                    "The bulk memory limit is set to more than {} bytes. It is recommended to set the limit between 5 to 15 MB.",
+                    RECOMMENDED_MAX_BULK_MEMORY_LIMIT);
+        }
+    }
+
+    protected ZeebeMongoClient createClient() {
+        return new ZeebeMongoClient(configuration, log);
+    }
+
+    private void flushAndReschedule() {
+        try {
+            flush();
+        } catch (final Exception e) {
+            log.error(
+                    "Unexpected exception occurred on periodically flushing bulk, will retry later.", e);
+        }
+        scheduleDelayedFlush();
+    }
+
+    private void scheduleDelayedFlush() {
+        controller.scheduleCancellableTask(Duration.ofSeconds(configuration.bulk.delay), this::flushAndReschedule);
+    }
+
+    private void flush() {
+        client.flush();
+        controller.updateLastExportedRecordPosition(lastPosition);
+    }
+
+    private void createCols() {
+        final ColConfiguration col = configuration.col;
+
+        if (col.createCollections) {
+            if (col.deployment) {
+                createValueCol(ValueType.DEPLOYMENT);
+            }
+            if (col.error) {
+                createValueCol(ValueType.ERROR);
+            }
+            if (col.incident) {
+                createValueCol(ValueType.INCIDENT);
+            }
+            if (col.job) {
+                createValueCol(ValueType.JOB);
+            }
+            if (col.jobBatch) {
+                createValueCol(ValueType.JOB_BATCH);
+            }
+            if (col.message) {
+                createValueCol(ValueType.MESSAGE);
+            }
+            if (col.messageSubscription) {
+                createValueCol(ValueType.MESSAGE_SUBSCRIPTION);
+            }
+            if (col.variable) {
+                createValueCol(ValueType.VARIABLE);
+            }
+            if (col.variableDocument) {
+                createValueCol(ValueType.VARIABLE_DOCUMENT);
+            }
+            if (col.workflowInstance) {
+                createValueCol(ValueType.PROCESS_INSTANCE);
+            }
+            if (col.workflowInstanceCreation) {
+                createValueCol(ValueType.PROCESS_INSTANCE_CREATION);
+            }
+            if (col.workflowInstanceSubscription) {
+                createValueCol(ValueType.PROCESS_MESSAGE_SUBSCRIPTION);
+            }
+        }
+
+        colsCreated = true;
+    }
+
+    private void createValueCol(final ValueType valueType) {
+        if (!client.createCollection(valueType)) {
+            log.warn("Put index template for value type {} was not acknowledged", valueType);
+        }
+    }
+
+    private static class MongoRecordFilter implements Context.RecordFilter {
+
+        private final MongoExporterConfiguration configuration;
+
+        MongoRecordFilter(final MongoExporterConfiguration configuration) {
+            this.configuration = configuration;
+        }
+
+        @Override
+        public boolean acceptType(final RecordType recordType) {
+            return configuration.shouldInsertRecordType(recordType);
+        }
+
+        @Override
+        public boolean acceptValue(final ValueType valueType) {
+            return configuration.shouldInsertValueType(valueType);
+        }
+    }
+
+}
