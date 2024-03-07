@@ -9,7 +9,7 @@
     - ./exporters/mongodb-exporter-0.0.1-SNAPSHOT.jar:/usr/local/zeebe/lib/mongodb-exporter-0.0.1-SNAPSHOT.jar
  
       
--Zeebe config [application.yaml]
+- Zeebe config [application.yaml]
 - zeebe:
   broker:
     exporters:
